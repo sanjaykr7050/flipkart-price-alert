@@ -145,7 +145,10 @@ def read_price(product):
             ),
         )
         page = context.new_page()
-        page.goto(product["url"], wait_until="domcontentloaded", timeout=60000)
+        # Some Flipkart pages keep background requests open and never fire
+        # domcontentloaded on cloud runners. "commit" returns as soon as the
+        # first response arrives; the short wait below lets the price render.
+        page.goto(product["url"], wait_until="commit", timeout=30000)
         page.wait_for_timeout(3000)
 
         for selector in ['button:has-text("✕")', 'button[aria-label="Close"]']:
@@ -210,10 +213,12 @@ def check_all_products():
     products = load_products()
     state = load_state()
     errors = []
+    successful_checks = 0
 
     for product in products:
         try:
             title, current_price, pin_applied = read_price(product)
+            successful_checks += 1
             timestamp = datetime.now().strftime("%d-%m-%Y %I:%M %p")
             print(
                 f"[{timestamp}] {title}: ₹{current_price:,.2f} | "
@@ -245,6 +250,8 @@ def check_all_products():
     save_state(state)
 
     if errors:
+        print(f"Warning: {len(errors)} product(s) skipped; next run mein retry hoga.")
+    if successful_checks == 0:
         raise RuntimeError(" | ".join(errors))
 
 
