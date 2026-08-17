@@ -4,6 +4,7 @@ import re
 import time
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -12,13 +13,6 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-PRODUCT_URL = os.getenv(
-    "PRODUCT_URL",
-    "https://www.flipkart.com/horlicks-nutrition-drink-jar/p/itmfaa093d013a02?pid=MDMETGMUEHP2YJDZ&marketplace=GROCERY",
-)
-PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Horlicks Nutrition Drink Jar")
-TARGET_PRICE = float(os.getenv("TARGET_PRICE", "380"))
-PIN_CODE = os.getenv("PIN_CODE", "827009")
 CHECK_MINUTES = max(30, int(os.getenv("CHECK_MINUTES", "60")))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -26,6 +20,7 @@ HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 RUN_ONCE = os.getenv("RUN_ONCE", "false").lower() == "true"
 
 STATE_FILE = Path("alert_state.json")
+PRODUCTS_FILE = Path("products.json")
 
 
 def validate_settings():
@@ -35,7 +30,45 @@ def validate_settings():
     if not CHAT_ID:
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
-        raise RuntimeError(".env mein ye values bhariye: " + ", ".join(missing))
+        raise RuntimeError("Missing settings: " + ", ".join(missing))
+
+
+def load_products():
+    if PRODUCTS_FILE.exists():
+        products = json.loads(PRODUCTS_FILE.read_text(encoding="utf-8"))
+    else:
+        products = [
+            {
+                "name": os.getenv("PRODUCT_NAME", "Horlicks Nutrition Drink Jar"),
+                "url": os.getenv(
+                    "PRODUCT_URL",
+                    "https://www.flipkart.com/horlicks-nutrition-drink-jar/p/itmfaa093d013a02?pid=MDMETGMUEHP2YJDZ&marketplace=GROCERY",
+                ),
+                "target_price": float(os.getenv("TARGET_PRICE", "380")),
+                "pin_code": os.getenv("PIN_CODE", "827009"),
+            }
+        ]
+
+    if not isinstance(products, list) or not products:
+        raise RuntimeError("products.json mein kam-se-kam ek product hona chahiye.")
+
+    required = {"name", "url", "target_price", "pin_code"}
+    for index, product in enumerate(products, start=1):
+        missing = required - set(product)
+        if missing:
+            raise RuntimeError(
+                f"Product {index} mein missing fields: {', '.join(sorted(missing))}"
+            )
+        product["target_price"] = float(product["target_price"])
+        product["pin_code"] = str(product["pin_code"])
+    return products
+
+
+def product_key(product):
+    pid = parse_qs(urlparse(product["url"]).query).get("pid", [])
+    if pid:
+        return pid[0]
+    return re.sub(r"[^a-zA-Z0-9]+", "-", product["name"]).strip("-").lower()
 
 
 def send_telegram(message):
@@ -79,7 +112,7 @@ def price_from_json_ld(page):
     return None
 
 
-def set_delivery_pin(page):
+def set_delivery_pin(page, pin_code):
     selectors = [
         'input[placeholder*="pincode" i]',
         'input[placeholder*="pin code" i]',
@@ -89,7 +122,7 @@ def set_delivery_pin(page):
         field = page.locator(selector).first
         try:
             if field.count() and field.is_visible(timeout=1500):
-                field.fill(PIN_CODE)
+                field.fill(pin_code)
                 field.press("Enter")
                 page.wait_for_timeout(3500)
                 return True
@@ -98,7 +131,7 @@ def set_delivery_pin(page):
     return False
 
 
-def read_price():
+def read_price(product):
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=HEADLESS)
         context = browser.new_context(
@@ -112,10 +145,9 @@ def read_price():
             ),
         )
         page = context.new_page()
-        page.goto(PRODUCT_URL, wait_until="domcontentloaded", timeout=60000)
+        page.goto(product["url"], wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
-        # Login popup dikhe to band karne ki koshish.
         for selector in ['button:has-text("✕")', 'button[aria-label="Close"]']:
             try:
                 button = page.locator(selector).first
@@ -125,9 +157,9 @@ def read_price():
             except Exception:
                 pass
 
-        pin_applied = set_delivery_pin(page)
-
+        pin_applied = set_delivery_pin(page, product["pin_code"])
         price = price_from_json_ld(page)
+
         if not price:
             selectors = [
                 '[itemprop="price"]',
@@ -148,75 +180,91 @@ def read_price():
                 except Exception:
                     continue
 
-        title = page.title().split("-")[0].strip() or PRODUCT_NAME
-        screenshot = "last_check.png"
-        page.screenshot(path=screenshot, full_page=False)
+        title = page.title().split("-")[0].strip() or product["name"]
+        page.screenshot(path=f"last_check_{product_key(product)}.png", full_page=False)
         browser.close()
 
     if not price:
-        raise RuntimeError(
-            "Price page par nahi mili. last_check.png dekhkar HEADLESS=false se test karein."
-        )
+        raise RuntimeError(f'{product["name"]}: price page par nahi mili.')
     return title, price, pin_applied
 
 
 def load_state():
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(state, dict):
-            return state
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return {"last_alert_price": None, "last_check_date": None}
+        if not isinstance(state, dict):
+            raise ValueError
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        state = {}
+    if not isinstance(state.get("alerts"), dict):
+        state["alerts"] = {}
+    state.setdefault("last_check_date", None)
+    return state
 
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
-def check_once():
-    title, current_price, pin_applied = read_price()
-    timestamp = datetime.now().strftime("%d-%m-%Y %I:%M %p")
-    print(f"[{timestamp}] {title}: ₹{current_price:,.2f} | PIN applied: {pin_applied}")
-
+def check_all_products():
+    products = load_products()
     state = load_state()
-    last_alert_price = state.get("last_alert_price")
-    if current_price <= TARGET_PRICE and current_price != last_alert_price:
-        send_telegram(
-            "🔥 Flipkart Price Alert!\n\n"
-            f"{PRODUCT_NAME}\n"
-            f"Current price: ₹{current_price:,.0f}\n"
-            f"Target price: ₹{TARGET_PRICE:,.0f}\n"
-            f"Delivery PIN: {PIN_CODE}\n\n"
-            f"Buy now: {PRODUCT_URL}"
-        )
-        state["last_alert_price"] = current_price
-    elif current_price > TARGET_PRICE and last_alert_price is not None:
-        state["last_alert_price"] = None
+    errors = []
 
-    # Cloud workflow isse din mein ek status commit karta hai. Isse scheduled
-    # workflow inactive nahi hota aur duplicate-alert state bhi safe rehti hai.
+    for product in products:
+        try:
+            title, current_price, pin_applied = read_price(product)
+            timestamp = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+            print(
+                f"[{timestamp}] {title}: ₹{current_price:,.2f} | "
+                f'PIN {product["pin_code"]}: {pin_applied}'
+            )
+
+            key = product_key(product)
+            last_alert_price = state["alerts"].get(key)
+            target_price = product["target_price"]
+
+            if current_price <= target_price and current_price != last_alert_price:
+                send_telegram(
+                    "🔥 Flipkart Price Alert!\n\n"
+                    f'{product["name"]}\n'
+                    f"Current price: ₹{current_price:,.0f}\n"
+                    f"Target price: ₹{target_price:,.0f}\n"
+                    f'Delivery PIN: {product["pin_code"]}\n\n'
+                    f'Buy now: {product["url"]}'
+                )
+                state["alerts"][key] = current_price
+            elif current_price > target_price and last_alert_price is not None:
+                state["alerts"].pop(key, None)
+
+        except Exception as error:
+            errors.append(f'{product["name"]}: {error}')
+            print("Check failed:", errors[-1])
+
     state["last_check_date"] = date.today().isoformat()
     save_state(state)
+
+    if errors:
+        raise RuntimeError(" | ".join(errors))
 
 
 def main():
     validate_settings()
+    products = load_products()
+
     if RUN_ONCE:
-        check_once()
+        check_all_products()
         return
 
     send_telegram(
-        "✅ Flipkart Price Alert Bot start ho gaya.\n"
-        f"Product: {PRODUCT_NAME}\n"
-        f"Target: ₹{TARGET_PRICE:,.0f}\n"
-        f"PIN: {PIN_CODE}"
+        "✅ Flipkart Multi-Product Alert Bot start ho gaya.\n"
+        f"Total products: {len(products)}"
     )
     while True:
         try:
-            check_once()
+            check_all_products()
         except Exception as error:
-            print("Check failed:", error)
+            print("Check cycle failed:", error)
         time.sleep(CHECK_MINUTES * 60)
 
 
