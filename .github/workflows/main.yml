@@ -10,9 +10,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: flipkart-price-alert
-  cancel-in-progress: false
 
 jobs:
   check-price:
