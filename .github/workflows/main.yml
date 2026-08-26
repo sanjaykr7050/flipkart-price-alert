@@ -1,5 +1,7 @@
 name: Flipkart price alert
-
+concurrency:
+  group: flipkart-price-alert
+  cancel-in-progress: false
 on:
   schedule:
     - cron: "17 * * * *"
