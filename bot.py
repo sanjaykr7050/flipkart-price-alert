@@ -132,65 +132,200 @@ def set_delivery_pin(page, pin_code):
 
 
 def read_price(product):
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-            viewport={"width": 1365, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-        # Some Flipkart pages keep background requests open and never fire
-        # domcontentloaded on cloud runners. "commit" returns as soon as the
-        # first response arrives; the short wait below lets the price render.
-        page.goto(product["url"], wait_until="commit", timeout=30000)
-        page.wait_for_timeout(3000)
+    last_error = None
 
-        for selector in ['button:has-text("✕")', 'button[aria-label="Close"]']:
+    for attempt in range(1, 4):
+        browser = None
+        context = None
+
+        try:
+            print(
+                f'Checking "{product["name"]}" '
+                f"(attempt {attempt}/3)..."
+            )
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=HEADLESS,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
+                )
+
+                context = browser.new_context(
+                    locale="en-IN",
+                    timezone_id="Asia/Kolkata",
+                    viewport={"width": 1365, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    extra_http_headers={
+                        "Accept-Language": "en-IN,en;q=0.9",
+                    },
+                )
+
+                page = context.new_page()
+
+                # Give Playwright enough time on GitHub Actions.
+                page.set_default_timeout(10000)
+                page.set_default_navigation_timeout(45000)
+
+                try:
+                    response = page.goto(
+                        product["url"],
+                        wait_until="commit",
+                        timeout=45000,
+                    )
+
+                    print(
+                        f'Navigation completed for "{product["name"]}" '
+                        f"(status={response.status if response else 'unknown'})"
+                    )
+
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Navigation failed: {type(error).__name__}: {error}"
+                    )
+
+                # Allow Flipkart's dynamically loaded content to appear.
+                page.wait_for_timeout(5000)
+
+                # Detect obvious block/challenge pages.
+                page_text = ""
+                try:
+                    page_text = page.locator("body").inner_text(
+                        timeout=5000
+                    ).lower()
+                except Exception:
+                    pass
+
+                blocked_words = [
+                    "captcha",
+                    "access denied",
+                    "request blocked",
+                    "unusual traffic",
+                    "robot",
+                    "verify you are human",
+                ]
+
+                if any(word in page_text for word in blocked_words):
+                    raise RuntimeError(
+                        "Flipkart block/challenge page detected"
+                    )
+
+                # Close popup if present.
+                for selector in [
+                    'button:has-text("✕")',
+                    'button[aria-label="Close"]',
+                ]:
+                    try:
+                        button = page.locator(selector).first
+                        if button.count() and button.is_visible(timeout=1000):
+                            button.click()
+                            break
+                    except Exception:
+                        pass
+
+                # Apply delivery PIN.
+                pin_applied = set_delivery_pin(
+                    page,
+                    product["pin_code"],
+                )
+
+                # Give price information a moment to render.
+                page.wait_for_timeout(2000)
+
+                price = price_from_json_ld(page)
+
+                # Fallback price selectors.
+                if not price:
+                    selectors = [
+                        '[itemprop="price"]',
+                        'meta[property="product:price:amount"]',
+                        'div.Nx9bqj.CxhGGd',
+                        'div.Nx9bqj',
+                        'div._30jeq3',
+                    ]
+
+                    for selector in selectors:
+                        try:
+                            node = page.locator(selector).first
+
+                            if not node.count():
+                                continue
+
+                            value = (
+                                node.get_attribute("content")
+                                or node.text_content()
+                            )
+
+                            price = money_to_float(value)
+
+                            if price:
+                                break
+
+                        except Exception:
+                            continue
+
+                if not price:
+                    raise RuntimeError(
+                        "Price could not be verified on the page"
+                    )
+
+                title = (
+                    page.title().split("-")[0].strip()
+                    or product["name"]
+                )
+
+                # Save screenshot for debugging.
+                try:
+                    page.screenshot(
+                        path=f"last_check_{product_key(product)}.png",
+                        full_page=False,
+                    )
+                except Exception:
+                    pass
+
+                print(
+                    f'Success: "{product["name"]}" '
+                    f"price=₹{price:,.2f}"
+                )
+
+                return title, price, pin_applied
+
+        except Exception as error:
+            last_error = error
+
+            print(
+                f'Attempt {attempt}/3 failed for '
+                f'"{product["name"]}": {error}'
+            )
+
+            if attempt < 3:
+                time.sleep(5)
+
+        finally:
             try:
-                button = page.locator(selector).first
-                if button.count() and button.is_visible(timeout=500):
-                    button.click()
-                    break
+                if context:
+                    context.close()
             except Exception:
                 pass
 
-        pin_applied = set_delivery_pin(page, product["pin_code"])
-        price = price_from_json_ld(page)
+            try:
+                if browser:
+                    browser.close()
+            except Exception:
+                pass
 
-        if not price:
-            selectors = [
-                '[itemprop="price"]',
-                'meta[property="product:price:amount"]',
-                'div.Nx9bqj.CxhGGd',
-                'div.Nx9bqj',
-                'div._30jeq3',
-            ]
-            for selector in selectors:
-                node = page.locator(selector).first
-                try:
-                    if not node.count():
-                        continue
-                    value = node.get_attribute("content") or node.text_content()
-                    price = money_to_float(value)
-                    if price:
-                        break
-                except Exception:
-                    continue
-
-        title = page.title().split("-")[0].strip() or product["name"]
-        page.screenshot(path=f"last_check_{product_key(product)}.png", full_page=False)
-        browser.close()
-
-    if not price:
-        raise RuntimeError(f'{product["name"]}: price page par nahi mili.')
-    return title, price, pin_applied
-
+    raise RuntimeError(
+        f'{product["name"]}: failed after 3 attempts. '
+        f"Last error: {last_error}"
+    )
 
 def load_state():
     try:
